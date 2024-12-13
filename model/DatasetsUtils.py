@@ -2,6 +2,8 @@ import numpy as np
 import tensorflow as tf
 from sklearn.model_selection import StratifiedKFold
 
+def rescale_batch_weights(X, y, w):
+    return X, y, (w / tf.reduce_sum(w)) * tf.cast(tf.shape(w)[0], tf.float64)
 
 class Apply:
 
@@ -86,7 +88,6 @@ class Map:
             else:
                 return flat_values
 
-
     class FromNumpy(LoadBatchByIndices):
         def __init__(self, data, data_type):
             self.data = data
@@ -98,4 +99,54 @@ class Map:
             batch = list()
             for i in idx.numpy():
                 batch.append(self.data[i])
+            return np.concatenate(batch, axis=0), np.array([v.shape[0] for v in batch])
+        
+    class LoadIndices:
+        def loader(self):
+            raise NotImplementedError
+
+        def __call__(self, sample_idx):
+            # flat_values and additional_args together should be the input into the ragged_constructor of the loader
+            indices, *additional_args = tf.py_function(self.loader, [sample_idx], [tf.bool])
+
+            return sample_idx, indices
+
+    class FromNumpytoIndices(LoadIndices):
+        def __init__(self, data, dropout=.2):
+            self.data = data
+            self.dropout = dropout
+
+        def loader(self, idx):
+            batch = list()
+            for i in idx.numpy():
+                batch.append(np.random.random(len(self.data[i])) > self.dropout)
+            return np.concatenate(batch, axis=0)
+
+    class LoadBatchByDroppedIndices:
+        def loader(self):
+            raise NotImplementedError
+
+        def __call__(self, sample_idx, boolean):
+            # flat_values and additional_args together should be the input into the ragged_constructor of the loader
+            flat_values, *additional_args = tf.py_function(self.loader, [sample_idx, boolean], self.tf_output_types)
+            flat_values.set_shape((None,) + self.inner_shape)
+
+            return self.ragged_constructor(flat_values, *additional_args)
+
+    class FromNumpyandIndices(LoadBatchByDroppedIndices):
+        def __init__(self, data, data_type):
+            self.data = data
+            self.tf_output_types = [data_type, tf.int32]
+            self.inner_shape = data[0].shape[1:]
+            self.ragged_constructor = tf.RaggedTensor.from_row_lengths
+
+        def loader(self, idx, boolean):
+            batch = list()
+            boolean = boolean.numpy()
+            index = 0
+            for i in idx.numpy():
+                temp_batch = self.data[i]
+                temp_boolean = boolean[index: index + len(temp_batch)]
+                batch.append(temp_batch[temp_boolean])
+                index += len(temp_batch)
             return np.concatenate(batch, axis=0), np.array([v.shape[0] for v in batch])

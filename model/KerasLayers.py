@@ -1,6 +1,17 @@
 import tensorflow as tf
 import numpy as np
+from lifelines.utils import concordance_index
 
+class Dropout(tf.keras.layers.Layer):
+    def __init__(self, dropout):
+        super(Dropout, self).__init__()
+        self.dropout = dropout
+
+    def call(self, inputs, training=None):
+        if not training:
+            return inputs * (1 - self.dropout)
+        else:
+            return inputs
 
 class Embed(tf.keras.layers.Layer):
     def __init__(self, embedding_dimension, trainable=False, triangular=False):
@@ -177,9 +188,6 @@ class Ragged:
 
             return pooled, attention_weights
 
-
-
-
 class Losses:
 
     class CrossEntropy(tf.keras.losses.Loss):
@@ -189,6 +197,23 @@ class Losses:
 
         def call(self, y_true, y_pred, loss_clip=0.):
             return tf.maximum(tf.keras.losses.CategoricalCrossentropy(reduction='none', from_logits=self.from_logits)(y_true, y_pred) - loss_clip, 0.)
+
+        def __call__(self, y_true, y_pred, sample_weight=None):
+            # get sample loss
+            losses = self.call(y_true, y_pred)
+            # return correct true weighted average if provided sample_weight
+            if sample_weight is not None:
+                return tf.reduce_sum(losses * sample_weight[:, 0], axis=0) / tf.reduce_sum(sample_weight)
+            else:
+                return tf.reduce_mean(losses, axis=0)
+            
+    class BinaryCrossEntropy(tf.keras.losses.Loss):
+        def __init__(self, name='BE', from_logits=True):
+            super(Losses.BinaryCrossEntropy, self).__init__(name=name)
+            self.from_logits = from_logits
+
+        def call(self, y_true, y_pred, loss_clip=0.):
+            return tf.maximum(tf.keras.losses.BinaryCrossentropy(reduction='none', from_logits=self.from_logits)(y_true, y_pred) - loss_clip, 0.)
 
         def __call__(self, y_true, y_pred, sample_weight=None):
             # get sample loss
@@ -241,6 +266,44 @@ class Losses:
                 return tf.reduce_sum(losses * sample_weight[:, 0]) / tf.reduce_sum(sample_weight)
             else:
                 return tf.reduce_mean(losses)
+            
+    class cox_loss(tf.keras.losses.Loss):
+        def __init__(self, name='coxl'):
+            super(Losses.cox_loss, self).__init__(name=name)
+
+        def call(self, y_true, y_pred):
+            # Extract time and event status
+            time_value = tf.squeeze(y_true[:, 0]) 
+            event = tf.squeeze(y_true[:, 1])
+            event = tf.cast(event, dtype=tf.bool)
+
+            # Get indices of events
+            ix = tf.where(event)[:, 0]
+
+            # Selected time values and events
+            sel_time = tf.gather(time_value, ix) 
+            selected_event = tf.cast(tf.gather(event, ix), tf.float32)
+
+            # Pairwise comparison matrix (only for event indices)
+            sel_mat = tf.cast(
+                tf.expand_dims(sel_time, 1) <= tf.expand_dims(time_value, 0), dtype=tf.float32)
+
+            # Compute risk summation
+            score = tf.squeeze(y_pred, axis=-1)
+            score_mean = tf.reduce_mean(score)
+            score_std = tf.math.reduce_std(score) + 1e-7
+            score = (score - score_mean) / score_std
+            risk_sum = tf.reduce_sum(sel_mat * tf.exp(score), axis=-1) 
+
+            # Compute partial likelihood
+            gathered_score = tf.gather(score, ix) 
+            log_risk_sum = tf.math.log(risk_sum)
+
+            # Compute partial likelihood (ensure all shapes are aligned)
+            p_lik = (gathered_score - log_risk_sum) * selected_event
+
+            loss = -tf.reduce_mean(p_lik)
+            return loss
 
 
 class Metrics:
@@ -262,6 +325,25 @@ class Metrics:
 
         def reset_states(self):
             self.CE.assign(0)
+
+    class BinaryCrossEntropy(tf.keras.metrics.Metric):
+        def __init__(self, name='BE', from_logits=True):
+            super(Metrics.BinaryCrossEntropy, self).__init__(name=name)
+            self.from_logits = from_logits
+            self.BE = self.add_weight(name='BE', initializer=tf.keras.initializers.constant(0.))
+
+        def update_state(self, y_true, y_pred, sample_weight=None):
+            losses = tf.keras.losses.BinaryCrossentropy(reduction='none', from_logits=self.from_logits)(y_true, y_pred)
+            if sample_weight is not None:
+                self.BE.assign(tf.reduce_sum(losses * sample_weight[:, 0]) / tf.reduce_sum(sample_weight))
+            else:
+                self.BE.assign(tf.reduce_mean(losses))
+
+        def result(self):
+            return self.BE
+
+        def reset_state(self):
+            self.BE.assign(0)
 
     class Accuracy(tf.keras.metrics.Metric):
         def __init__(self, name='accuracy'):
@@ -303,3 +385,32 @@ class Metrics:
         def reset_states(self):
             self.QL.assign(0)
 
+    class CIndex(tf.keras.metrics.Metric):
+        def __init__(self, name="lifelines_ci", **kwargs):
+            super(Metrics.CIndex, self).__init__(name=name, **kwargs)
+            self.total_ci = self.add_weight(name="total_ci", initializer="zeros")
+            self.num_batches = self.add_weight(name="num_batches", initializer="zeros")
+
+        def update_state(self, y_true, y_pred, sample_weight=None):
+            def compute_ci(y_true_np, y_pred_np):
+                time = y_true_np[:, 0]
+                event = y_true_np[:, 1]
+                ci = concordance_index(time, -y_pred_np, event)  # Negate scores for survival tasks
+                return ci
+
+            # Convert TensorFlow tensors to NumPy
+            ci = tf.py_function(
+                func=compute_ci,
+                inp=[y_true, y_pred],
+                Tout=tf.float32)
+
+            # Accumulate the metric
+            self.total_ci.assign_add(ci)
+            self.num_batches.assign_add(1.0)
+
+        def result(self):
+            return self.total_ci / self.num_batches  # Average C-index across batches
+
+        def reset_states(self):
+            self.total_ci.assign(0.0)
+            self.num_batches.assign(0.0)
